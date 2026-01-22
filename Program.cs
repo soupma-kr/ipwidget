@@ -22,7 +22,7 @@ namespace IPWidget
     public class OverlayForm : Form
     {
         private readonly Label _label;
-        private readonly Timer _timer;
+        private readonly System.Windows.Forms.Timer _timer;
 
         // ===== 설정 =====
         private const int RefreshSeconds = 10;          // 갱신 주기
@@ -74,7 +74,7 @@ namespace IPWidget
                 }
             };
 
-            _timer = new Timer { Interval = RefreshSeconds * 1000 };
+            _timer = new System.Windows.Forms.Timer { Interval = RefreshSeconds * 1000 };
             _timer.Tick += async (_, __) => await RefreshAsync();
             _timer.Start();
 
