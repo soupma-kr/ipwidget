@@ -1,7 +1,9 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.Net.Http;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -22,31 +24,29 @@ namespace IPWidget
 
     public class OverlayForm : Form
     {
-        // Settings
-        private const int RefreshSeconds = 10;
-        private const bool ShowPublicIP = true;   // public IP may be N/A in corporate networks
-        private const bool ShowTime = true;
-        private const bool ClickThrough = false; // set true if you want click-through widget
-
-        private bool _alwaysOnTop = true;
+        // ===== Settings =====
+        private const int NetRefreshSeconds = 5;        // 네트워크/인터넷 상태 갱신(요청대로 5초)
+        private const bool ClickThrough = false;        // 배경처럼 클릭 통과 원하면 true
+        private bool _alwaysOnTop = true;               // 항상 위 토글
         private static readonly Point StartPos = new Point(30, 30);
 
         private const int PadX = 14;
         private const int PadY = 12;
-        private const int MinW = 220;
-        private const int MinH = 70;
-
-        private readonly Label _label;
-        private readonly System.Windows.Forms.Timer _timer;
-
-        private static readonly HttpClient http = new HttpClient
-        {
-            Timeout = TimeSpan.FromSeconds(3)
-        };
+        private const int MinW = 240;
+        private const int MinH = 72;
 
         // Startup (HKCU Run)
         private const string RunKeyPath = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
         private const string RunValueName = "IPWidget";
+
+        private readonly Label _label;
+        private readonly System.Windows.Forms.Timer _clockTimer;   // 1초마다 시간 갱신
+        private readonly System.Windows.Forms.Timer _netTimer;     // 5초마다 네트워크 갱신
+
+        // 캐시(매초 전체 검사 안 하려고)
+        private string _localIp = "N/A";
+        private string _netName = "N/A";
+        private string _internet = "Unknown";
 
         public OverlayForm()
         {
@@ -96,18 +96,17 @@ namespace IPWidget
 
             menu.Items.Add(new ToolStripSeparator());
 
-            menu.Items.Add("Copy IPs", null, async (s, e) =>
+            menu.Items.Add("Copy", null, (s, e) =>
             {
-                var ips = await GetIPsAsync();
-                string local = ips.local;
-                string pub = ips.pub;
-                if (ShowPublicIP)
-                    Clipboard.SetText("Local: " + local + "\r\nPublic: " + pub);
-                else
-                    Clipboard.SetText("Local: " + local);
+                Clipboard.SetText("Local: " + _localIp + "\r\nNet: " + _netName + "\r\nInternet: " + _internet);
             });
 
-            menu.Items.Add("Refresh", null, async (s, e) => await RefreshAsync());
+            menu.Items.Add("Refresh now", null, async (s, e) =>
+            {
+                await RefreshNetworkAsync();
+                RefreshTextAndSize();
+            });
+
             menu.Items.Add("Exit", null, (s, e) => Close());
 
             ContextMenuStrip = menu;
@@ -122,13 +121,26 @@ namespace IPWidget
                 }
             };
 
-            // Timer
-            _timer = new System.Windows.Forms.Timer();
-            _timer.Interval = RefreshSeconds * 1000;
-            _timer.Tick += async (s, e) => await RefreshAsync();
-            _timer.Start();
+            // Timers
+            _clockTimer = new System.Windows.Forms.Timer();
+            _clockTimer.Interval = 1000;
+            _clockTimer.Tick += (s, e) => RefreshTextAndSize();
+            _clockTimer.Start();
 
-            Shown += async (s, e) => await RefreshAsync();
+            _netTimer = new System.Windows.Forms.Timer();
+            _netTimer.Interval = NetRefreshSeconds * 1000;
+            _netTimer.Tick += async (s, e) =>
+            {
+                await RefreshNetworkAsync();
+                RefreshTextAndSize();
+            };
+            _netTimer.Start();
+
+            Shown += async (s, e) =>
+            {
+                await RefreshNetworkAsync();
+                RefreshTextAndSize();
+            };
         }
 
         protected override CreateParams CreateParams
@@ -153,20 +165,15 @@ namespace IPWidget
             }
         }
 
-        private async Task RefreshAsync()
+        private void RefreshTextAndSize()
         {
-            var ips = await GetIPsAsync();
-            string local = ips.local;
-            string pub = ips.pub;
+            string time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
-            string text;
-            if (ShowPublicIP)
-                text = "Local  " + local + "\nPublic " + pub;
-            else
-                text = "Local  " + local;
-
-            if (ShowTime)
-                text += "\n" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            string text =
+                "Local   " + _localIp + "\n" +
+                "Net     " + _netName + "\n" +
+                "Internet " + _internet + "\n" +
+                time;
 
             _label.Text = text;
             _label.Location = new Point(PadX, PadY);
@@ -185,11 +192,11 @@ namespace IPWidget
             Invalidate();
         }
 
-        private static async Task<(string local, string pub)> GetIPsAsync()
+        private async Task RefreshNetworkAsync()
         {
-            string local = GetLocalIPv4FromIpconfig() ?? "N/A";
-            string pub = ShowPublicIP ? await GetPublicIPAsync() : "-";
-            return (local, pub);
+            _localIp = GetLocalIPv4FromIpconfig() ?? "N/A";
+            _netName = GetActiveNetworkName() ?? "N/A";
+            _internet = await CheckInternetByDnsAsync();
         }
 
         private static string? GetLocalIPv4FromIpconfig()
@@ -209,6 +216,55 @@ namespace IPWidget
 
             var m2 = Regex.Match(output, @"(\d{1,3}\.){3}\d{1,3}");
             return m2.Success ? m2.Value : null;
+        }
+
+        private static string? GetActiveNetworkName()
+        {
+            try
+            {
+                // Pick an "up" interface with a default gateway and not loopback/tunnel
+                var nics = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(n =>
+                        n.OperationalStatus == OperationalStatus.Up &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Tunnel);
+
+                foreach (var nic in nics)
+                {
+                    var ipProps = nic.GetIPProperties();
+                    bool hasGateway = ipProps.GatewayAddresses != null && ipProps.GatewayAddresses.Count > 0 &&
+                                      ipProps.GatewayAddresses.Any(g => g.Address != null && !IPAddress.IsLoopback(g.Address) && g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+
+                    if (hasGateway)
+                        return nic.Name; // e.g., "Ethernet", "Wi-Fi", VPN adapter name
+                }
+
+                // Fallback: first up interface name
+                var firstUp = nics.FirstOrDefault();
+                return firstUp?.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // A) DNS-only check: fast and usually allowed in corp networks
+        private static async Task<string> CheckInternetByDnsAsync()
+        {
+            try
+            {
+                // Windows NCSI DNS test host (commonly used by Windows to detect connectivity)
+                // If DNS resolves, we treat as "OK" per your A choice.
+                var entry = await Dns.GetHostEntryAsync("dns.msftncsi.com");
+                if (entry != null && entry.AddressList != null && entry.AddressList.Length > 0)
+                    return "OK";
+                return "Restricted";
+            }
+            catch
+            {
+                return "No Internet";
+            }
         }
 
         private static string RunCmd(string command)
@@ -232,20 +288,6 @@ namespace IPWidget
             catch
             {
                 return "";
-            }
-        }
-
-        private static async Task<string> GetPublicIPAsync()
-        {
-            try
-            {
-                var s = (await http.GetStringAsync("https://api.ipify.org")).Trim();
-                if (string.IsNullOrWhiteSpace(s)) return "N/A";
-                return s;
-            }
-            catch
-            {
-                return "N/A";
             }
         }
 
@@ -292,7 +334,7 @@ namespace IPWidget
             }
             catch
             {
-                // Some corporate policies may block this. In that case, use shell:startup shortcut.
+                // If blocked by policy, use shell:startup shortcut instead.
             }
         }
 
